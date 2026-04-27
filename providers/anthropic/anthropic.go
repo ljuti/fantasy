@@ -998,11 +998,22 @@ func toPrompt(prompt fantasy.Prompt, sendReasoningData bool) ([]anthropic.TextBl
 						}
 						if toolCall.ProviderExecuted {
 							// Reconstruct server_tool_use block for
-							// multi-turn round-tripping.
+							// multi-turn round-tripping. Empty input
+							// is valid (parameterless tool); malformed
+							// input is surfaced as a warning rather
+							// than dropping the block, since dropping
+							// would orphan the matching tool_result
+							// and cause the API to reject the next
+							// request.
 							var inputAny any
-							err := json.Unmarshal([]byte(toolCall.Input), &inputAny)
-							if err != nil {
-								continue
+							if trimmed := strings.TrimSpace(toolCall.Input); trimmed != "" {
+								if err := json.Unmarshal([]byte(trimmed), &inputAny); err != nil {
+									warnings = append(warnings, fantasy.CallWarning{
+										Type:    fantasy.CallWarningTypeOther,
+										Message: fmt.Sprintf("malformed input for server tool call %q (%s); emitting block with empty input: %v", toolCall.ToolCallID, toolCall.ToolName, err),
+									})
+									inputAny = nil
+								}
 							}
 							anthropicContent = append(anthropicContent, anthropic.ContentBlockParamUnion{
 								OfServerToolUse: &anthropic.ServerToolUseBlockParam{
@@ -1013,10 +1024,22 @@ func toPrompt(prompt fantasy.Prompt, sendReasoningData bool) ([]anthropic.TextBl
 							})
 							continue
 						}
-						var inputMap map[string]any
-						err := json.Unmarshal([]byte(toolCall.Input), &inputMap)
-						if err != nil {
-							continue
+						// Empty/whitespace-only input is valid for
+						// parameterless tool calls and round-trips as
+						// {}. Malformed input still emits the block
+						// (with {}) plus a warning, because dropping
+						// the tool_use here orphans the matching
+						// tool_result and triggers an API 400 on the
+						// next round-trip.
+						inputMap := map[string]any{}
+						if trimmed := strings.TrimSpace(toolCall.Input); trimmed != "" {
+							if err := json.Unmarshal([]byte(trimmed), &inputMap); err != nil {
+								warnings = append(warnings, fantasy.CallWarning{
+									Type:    fantasy.CallWarningTypeOther,
+									Message: fmt.Sprintf("malformed input for tool call %q (%s); emitting block with empty input: %v", toolCall.ToolCallID, toolCall.ToolName, err),
+								})
+								inputMap = map[string]any{}
+							}
 						}
 						toolUseBlock := anthropic.NewToolUseBlock(toolCall.ToolCallID, inputMap, toolCall.ToolName)
 						if cacheControl != nil {

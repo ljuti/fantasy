@@ -176,9 +176,13 @@ func TestToPrompt_DropsEmptyMessages(t *testing.T) {
 		require.Empty(t, warnings)
 	})
 
-	t.Run("should drop assistant messages with invalid tool input", func(t *testing.T) {
+	t.Run("should preserve tool_use block with malformed input and warn", func(t *testing.T) {
 		t.Parallel()
 
+		// Dropping a tool_use block on malformed input would orphan
+		// the matching tool_result in the next user message and cause
+		// the Anthropic API to reject the next request with a 400.
+		// We emit the block with empty input plus a warning instead.
 		prompt := fantasy.Prompt{
 			{
 				Role: fantasy.MessageRoleUser,
@@ -201,10 +205,11 @@ func TestToPrompt_DropsEmptyMessages(t *testing.T) {
 		systemBlocks, messages, warnings := toPrompt(prompt, true)
 
 		require.Empty(t, systemBlocks)
-		require.Len(t, messages, 1, "should only have user message")
+		require.Len(t, messages, 2, "should have both user and assistant messages")
 		require.Len(t, warnings, 1)
 		require.Equal(t, fantasy.CallWarningTypeOther, warnings[0].Type)
-		require.Contains(t, warnings[0].Message, "dropping empty assistant message")
+		require.Contains(t, warnings[0].Message, "malformed input")
+		require.Contains(t, warnings[0].Message, "call_123")
 	})
 
 	t.Run("should keep assistant messages with reasoning and text", func(t *testing.T) {
@@ -828,6 +833,179 @@ func TestToPrompt_WebSearchProviderExecutedToolResults(t *testing.T) {
 	// Third content block: plain text.
 	require.NotNil(t, assistantMsg.Content[2].OfText)
 	require.Equal(t, "Here is what I found.", assistantMsg.Content[2].OfText.Text)
+}
+
+// TestToPrompt_ToolCallEmptyInputPreserved guards the parameterless
+// tool-call case: some anthropic-compat upstreams (notably DeepSeek)
+// emit tool_use blocks with empty Input. Dropping the block here would
+// orphan the matching tool_result and cause the Anthropic API to reject
+// the next request with HTTP 400 ("tool_result must have a corresponding
+// tool_use in the previous message").
+func TestToPrompt_ToolCallEmptyInputPreserved(t *testing.T) {
+	t.Parallel()
+
+	prompt := fantasy.Prompt{
+		{
+			Role: fantasy.MessageRoleUser,
+			Content: []fantasy.MessagePart{
+				fantasy.TextPart{Text: "What time is it?"},
+			},
+		},
+		{
+			Role: fantasy.MessageRoleAssistant,
+			Content: []fantasy.MessagePart{
+				fantasy.ToolCallPart{
+					ToolCallID: "call_empty",
+					ToolName:   "get_current_time",
+					Input:      "",
+				},
+			},
+		},
+		{
+			Role: fantasy.MessageRoleTool,
+			Content: []fantasy.MessagePart{
+				fantasy.ToolResultPart{
+					ToolCallID: "call_empty",
+					Output: fantasy.ToolResultOutputContentText{
+						Text: "12:34",
+					},
+				},
+			},
+		},
+	}
+
+	_, messages, warnings := toPrompt(prompt, true)
+
+	require.Empty(t, warnings, "no warnings expected for empty input")
+	require.Len(t, messages, 3, "expected user + assistant + tool-result user messages")
+
+	// Assistant message must contain a tool_use block with empty
+	// (but non-nil) input map so the block round-trips correctly.
+	assistantMsg := messages[1]
+	require.Len(t, assistantMsg.Content, 1)
+	toolUse := assistantMsg.Content[0].OfToolUse
+	require.NotNil(t, toolUse, "assistant message must contain a tool_use block")
+	require.Equal(t, "call_empty", toolUse.ID)
+	require.Equal(t, "get_current_time", toolUse.Name)
+	inputMap, ok := toolUse.Input.(map[string]any)
+	require.True(t, ok, "Input should be a map[string]any, got %T", toolUse.Input)
+	require.Empty(t, inputMap, "Input should be an empty map")
+
+	// Final user message must contain the matching tool_result.
+	toolResultMsg := messages[2]
+	require.Len(t, toolResultMsg.Content, 1)
+	toolResult := toolResultMsg.Content[0].OfToolResult
+	require.NotNil(t, toolResult, "user message must contain a tool_result block")
+	require.Equal(t, "call_empty", toolResult.ToolUseID,
+		"tool_result must reference the preserved tool_use id")
+}
+
+// TestToPrompt_ToolCallMalformedInputPreserved guards the malformed-but-
+// non-empty input case: rather than dropping the block (which orphans the
+// tool_result), we emit the block with empty input and surface a warning.
+func TestToPrompt_ToolCallMalformedInputPreserved(t *testing.T) {
+	t.Parallel()
+
+	prompt := fantasy.Prompt{
+		{
+			Role: fantasy.MessageRoleUser,
+			Content: []fantasy.MessagePart{
+				fantasy.TextPart{Text: "Hi"},
+			},
+		},
+		{
+			Role: fantasy.MessageRoleAssistant,
+			Content: []fantasy.MessagePart{
+				fantasy.ToolCallPart{
+					ToolCallID: "call_bad",
+					ToolName:   "get_weather",
+					Input:      "{not json",
+				},
+			},
+		},
+		{
+			Role: fantasy.MessageRoleTool,
+			Content: []fantasy.MessagePart{
+				fantasy.ToolResultPart{
+					ToolCallID: "call_bad",
+					Output: fantasy.ToolResultOutputContentText{
+						Text: "sunny",
+					},
+				},
+			},
+		},
+	}
+
+	_, messages, warnings := toPrompt(prompt, true)
+
+	require.Len(t, messages, 3, "expected user + assistant + tool-result user messages")
+	require.Len(t, warnings, 1, "malformed input should produce one warning")
+	require.Equal(t, fantasy.CallWarningTypeOther, warnings[0].Type)
+	require.Contains(t, warnings[0].Message, "malformed input")
+	require.Contains(t, warnings[0].Message, "call_bad",
+		"warning should name the offending tool call id")
+
+	// Tool_use block is still present, with empty input.
+	assistantMsg := messages[1]
+	require.Len(t, assistantMsg.Content, 1)
+	toolUse := assistantMsg.Content[0].OfToolUse
+	require.NotNil(t, toolUse, "tool_use block must be preserved despite malformed input")
+	require.Equal(t, "call_bad", toolUse.ID)
+	inputMap, ok := toolUse.Input.(map[string]any)
+	require.True(t, ok, "Input should fall back to a map[string]any, got %T", toolUse.Input)
+	require.Empty(t, inputMap)
+
+	// Matching tool_result is still paired.
+	toolResultMsg := messages[2]
+	require.Len(t, toolResultMsg.Content, 1)
+	require.NotNil(t, toolResultMsg.Content[0].OfToolResult)
+	require.Equal(t, "call_bad", toolResultMsg.Content[0].OfToolResult.ToolUseID)
+}
+
+// TestToPrompt_ServerToolCallEmptyInputPreserved exercises the same
+// preservation guarantee on the ProviderExecuted (server_tool_use) branch.
+func TestToPrompt_ServerToolCallEmptyInputPreserved(t *testing.T) {
+	t.Parallel()
+
+	prompt := fantasy.Prompt{
+		{
+			Role: fantasy.MessageRoleUser,
+			Content: []fantasy.MessagePart{
+				fantasy.TextPart{Text: "Search"},
+			},
+		},
+		{
+			Role: fantasy.MessageRoleAssistant,
+			Content: []fantasy.MessagePart{
+				fantasy.ToolCallPart{
+					ToolCallID:       "srvtoolu_empty",
+					ToolName:         "web_search",
+					Input:            "",
+					ProviderExecuted: true,
+				},
+				fantasy.ToolResultPart{
+					ToolCallID:       "srvtoolu_empty",
+					ProviderExecuted: true,
+					ProviderOptions: fantasy.ProviderOptions{
+						Name: &WebSearchResultMetadata{},
+					},
+				},
+				fantasy.TextPart{Text: "done"},
+			},
+		},
+	}
+
+	_, messages, warnings := toPrompt(prompt, true)
+
+	require.Empty(t, warnings)
+	require.Len(t, messages, 2)
+
+	assistantMsg := messages[1]
+	require.GreaterOrEqual(t, len(assistantMsg.Content), 1)
+	serverToolUse := assistantMsg.Content[0].OfServerToolUse
+	require.NotNil(t, serverToolUse, "server_tool_use block must be preserved")
+	require.Equal(t, "srvtoolu_empty", serverToolUse.ID)
+	require.Nil(t, serverToolUse.Input, "empty input should map to nil for server_tool_use")
 }
 
 func TestGenerate_WebSearchResponse(t *testing.T) {
