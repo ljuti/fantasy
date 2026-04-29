@@ -325,7 +325,7 @@ func ToPromptFunc(prompt fantasy.Prompt, _, _ string) ([]openaisdk.ChatCompletio
 			assistantMsg := openaisdk.ChatCompletionAssistantMessageParam{
 				Role: "assistant",
 			}
-			var reasoningText string
+			var reasoningBuf strings.Builder
 			for _, c := range msg.Content {
 				switch c.GetType() {
 				case fantasy.ContentTypeText:
@@ -349,7 +349,11 @@ func ToPromptFunc(prompt fantasy.Prompt, _, _ string) ([]openaisdk.ChatCompletio
 						})
 						continue
 					}
-					reasoningText = reasoningPart.Text
+					// Accumulate across multiple ReasoningParts within a
+					// single turn. Some providers stream reasoning in
+					// chunks that re-emit as separate parts; overwriting
+					// would lose all but the last.
+					reasoningBuf.WriteString(reasoningPart.Text)
 					hasReasoning = true
 				case fantasy.ContentTypeToolCall:
 					toolCallPart, ok := fantasy.AsContentType[fantasy.ToolCallPart](c)
@@ -373,6 +377,7 @@ func ToPromptFunc(prompt fantasy.Prompt, _, _ string) ([]openaisdk.ChatCompletio
 						})
 				}
 			}
+			reasoningText := reasoningBuf.String()
 			// Add reasoning_content field if present, or if thinking is enabled
 			// and the message has tool calls (some providers like Kimi require
 			// reasoning_content on all assistant messages when thinking is enabled).
@@ -380,6 +385,20 @@ func ToPromptFunc(prompt fantasy.Prompt, _, _ string) ([]openaisdk.ChatCompletio
 				assistantMsg.SetExtraFields(map[string]any{
 					"reasoning_content": reasoningText,
 				})
+			}
+			// Providers that enforce reasoning round-trip in thinking mode
+			// (DeepSeek, Kimi, GLM-x reasoner, ...) reject the next request
+			// when a historical assistant turn is missing reasoning_content.
+			// A reasoning-only assistant turn would otherwise fail the
+			// visibility check below and be dropped, creating exactly that
+			// gap. Set Content to an empty string so the message has a
+			// valid OpenAI assistant shape (content: "") and survives.
+			if reasoningText != "" && param.IsOmitted(assistantMsg.Content.OfString) &&
+				len(assistantMsg.Content.OfArrayOfContentParts) == 0 &&
+				len(assistantMsg.ToolCalls) == 0 {
+				assistantMsg.Content = openaisdk.ChatCompletionAssistantMessageParamContentUnion{
+					OfString: param.NewOpt(""),
+				}
 			}
 			if !hasVisibleCompatAssistantContent(&assistantMsg) {
 				warnings = append(warnings, fantasy.CallWarning{

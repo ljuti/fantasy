@@ -62,9 +62,15 @@ func TestToPromptFunc_ReasoningContent(t *testing.T) {
 		require.Equal(t, "What about 3+3?", msg3.Content.OfString.Value)
 	})
 
-	t.Run("should handle assistant messages with only reasoning content", func(t *testing.T) {
+	t.Run("should preserve reasoning-only assistant messages with empty content", func(t *testing.T) {
 		t.Parallel()
 
+		// Providers that enforce reasoning round-trip in thinking mode
+		// (DeepSeek, Kimi, GLM-x reasoner, ...) reject the next request
+		// when a historical assistant turn is missing reasoning_content.
+		// Dropping a reasoning-only message would create exactly that gap;
+		// instead, keep the message with empty content + reasoning_content
+		// in extra fields. content: "" is a valid OpenAI assistant shape.
 		prompt := fantasy.Prompt{
 			{
 				Role: fantasy.MessageRoleUser,
@@ -82,14 +88,102 @@ func TestToPromptFunc_ReasoningContent(t *testing.T) {
 
 		messages, warnings := ToPromptFunc(prompt, "", "")
 
-		require.Len(t, warnings, 1)
-		require.Contains(t, warnings[0].Message, "dropping empty assistant message")
-		require.Len(t, messages, 1) // Only user message, assistant message dropped
+		require.Empty(t, warnings, "reasoning-only message should be preserved without warning")
+		require.Len(t, messages, 2)
 
 		// User message - unchanged
-		msg := messages[0].OfUser
-		require.NotNil(t, msg)
-		require.Equal(t, "Hello", msg.Content.OfString.Value)
+		userMsg := messages[0].OfUser
+		require.NotNil(t, userMsg)
+		require.Equal(t, "Hello", userMsg.Content.OfString.Value)
+
+		// Assistant message - kept with empty content + reasoning_content
+		assistantMsg := messages[1].OfAssistant
+		require.NotNil(t, assistantMsg)
+		require.Equal(t, "", assistantMsg.Content.OfString.Value)
+		extraFields := assistantMsg.ExtraFields()
+		reasoningContent, hasReasoning := extraFields["reasoning_content"]
+		require.True(t, hasReasoning)
+		require.Equal(t, "Internal reasoning only...", reasoningContent)
+	})
+
+	t.Run("should accumulate multiple ReasoningParts in a single assistant message", func(t *testing.T) {
+		t.Parallel()
+
+		prompt := fantasy.Prompt{
+			{
+				Role: fantasy.MessageRoleUser,
+				Content: []fantasy.MessagePart{
+					fantasy.TextPart{Text: "What's 2+2?"},
+				},
+			},
+			{
+				Role: fantasy.MessageRoleAssistant,
+				Content: []fantasy.MessagePart{
+					fantasy.ReasoningPart{Text: "Step 1: recall arithmetic. "},
+					fantasy.ReasoningPart{Text: "Step 2: compute. "},
+					fantasy.TextPart{Text: "4"},
+				},
+			},
+		}
+
+		messages, warnings := ToPromptFunc(prompt, "", "")
+
+		require.Empty(t, warnings)
+		require.Len(t, messages, 2)
+		assistantMsg := messages[1].OfAssistant
+		require.NotNil(t, assistantMsg)
+		require.Equal(t, "4", assistantMsg.Content.OfString.Value)
+		extraFields := assistantMsg.ExtraFields()
+		reasoningContent, ok := extraFields["reasoning_content"]
+		require.True(t, ok, "reasoning_content should be set when ReasoningParts are present")
+		require.Equal(t, "Step 1: recall arithmetic. Step 2: compute. ", reasoningContent,
+			"multiple ReasoningParts must be concatenated, not overwritten")
+	})
+
+	t.Run("should preserve reasoning_content alongside tool calls in same message", func(t *testing.T) {
+		t.Parallel()
+
+		// Pins the case where a single assistant turn carries both
+		// ReasoningPart and ToolCallPart. Both must survive to the wire:
+		// dropping reasoning_content here would create the same
+		// round-trip gap that breaks DeepSeek/Kimi/GLM thinking mode.
+		prompt := fantasy.Prompt{
+			{
+				Role: fantasy.MessageRoleUser,
+				Content: []fantasy.MessagePart{
+					fantasy.TextPart{Text: "What's the weather in NYC?"},
+				},
+			},
+			{
+				Role: fantasy.MessageRoleAssistant,
+				Content: []fantasy.MessagePart{
+					fantasy.ReasoningPart{Text: "User wants weather. Call the tool."},
+					fantasy.ToolCallPart{
+						ToolCallID: "call_abc",
+						ToolName:   "get_weather",
+						Input:      `{"location":"NYC"}`,
+					},
+				},
+			},
+		}
+
+		messages, warnings := ToPromptFunc(prompt, "", "")
+
+		require.Empty(t, warnings)
+		require.Len(t, messages, 2)
+
+		assistantMsg := messages[1].OfAssistant
+		require.NotNil(t, assistantMsg)
+		require.Len(t, assistantMsg.ToolCalls, 1, "tool_calls must be preserved")
+		toolCall := assistantMsg.ToolCalls[0].OfFunction
+		require.NotNil(t, toolCall)
+		require.Equal(t, "call_abc", toolCall.ID)
+		require.Equal(t, "get_weather", toolCall.Function.Name)
+
+		extraFields := assistantMsg.ExtraFields()
+		reasoningContent, hasReasoning := extraFields["reasoning_content"]
+		require.True(t, hasReasoning, "reasoning_content must accompany tool_calls when reasoning was emitted in the same turn")
+		require.Equal(t, "User wants weather. Call the tool.", reasoningContent)
 	})
 
 	t.Run("should not add reasoning_content to messages without reasoning", func(t *testing.T) {
