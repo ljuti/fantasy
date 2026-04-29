@@ -140,6 +140,52 @@ func TestToPromptFunc_ReasoningContent(t *testing.T) {
 			"multiple ReasoningParts must be concatenated, not overwritten")
 	})
 
+	t.Run("should preserve reasoning_content alongside tool calls in same message", func(t *testing.T) {
+		t.Parallel()
+
+		// Pins the case where a single assistant turn carries both
+		// ReasoningPart and ToolCallPart. Both must survive to the wire:
+		// dropping reasoning_content here would create the same
+		// round-trip gap that breaks DeepSeek/Kimi/GLM thinking mode.
+		prompt := fantasy.Prompt{
+			{
+				Role: fantasy.MessageRoleUser,
+				Content: []fantasy.MessagePart{
+					fantasy.TextPart{Text: "What's the weather in NYC?"},
+				},
+			},
+			{
+				Role: fantasy.MessageRoleAssistant,
+				Content: []fantasy.MessagePart{
+					fantasy.ReasoningPart{Text: "User wants weather. Call the tool."},
+					fantasy.ToolCallPart{
+						ToolCallID: "call_abc",
+						ToolName:   "get_weather",
+						Input:      `{"location":"NYC"}`,
+					},
+				},
+			},
+		}
+
+		messages, warnings := ToPromptFunc(prompt, "", "")
+
+		require.Empty(t, warnings)
+		require.Len(t, messages, 2)
+
+		assistantMsg := messages[1].OfAssistant
+		require.NotNil(t, assistantMsg)
+		require.Len(t, assistantMsg.ToolCalls, 1, "tool_calls must be preserved")
+		toolCall := assistantMsg.ToolCalls[0].OfFunction
+		require.NotNil(t, toolCall)
+		require.Equal(t, "call_abc", toolCall.ID)
+		require.Equal(t, "get_weather", toolCall.Function.Name)
+
+		extraFields := assistantMsg.ExtraFields()
+		reasoningContent, hasReasoning := extraFields["reasoning_content"]
+		require.True(t, hasReasoning, "reasoning_content must accompany tool_calls when reasoning was emitted in the same turn")
+		require.Equal(t, "User wants weather. Call the tool.", reasoningContent)
+	})
+
 	t.Run("should not add reasoning_content to messages without reasoning", func(t *testing.T) {
 		t.Parallel()
 
